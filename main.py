@@ -10,6 +10,8 @@ import os
 import re
 import random
 import time
+import sys
+import threading
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -93,16 +95,15 @@ STATE_CONFIG_KEY = "bot_state_json"
 # ================= SUPABASE POSTGRESQL =================
 
 class _PGConnection:
-    """Small compatibility layer for existing parameterized SQL statements."""
+    """Compatibility layer for parameterized SQL statements used by the bot."""
     def __init__(self, conn):
         self._conn = conn
         self._cur = conn.cursor(cursor_factory=__import__("psycopg2.extras", fromlist=["DictCursor"]).DictCursor)
 
     def execute(self, sql, params=None):
         raw = sql.strip()
-        # Translate the few SQLite-only constructs used by this project.
+        was_ignore = bool(re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", raw, flags=re.I))
         raw = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", raw, flags=re.I)
-        was_ignore = bool(re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", sql.strip(), flags=re.I))
         raw = raw.replace("?", "%s")
         raw = re.sub(r"ORDER BY rowid DESC", "ORDER BY ctid DESC", raw, flags=re.I)
         if was_ignore and not re.search(r"ON\s+CONFLICT", raw, flags=re.I):
@@ -120,28 +121,80 @@ class _PGConnection:
             if not statement:
                 continue
             statement = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", statement, flags=re.I)
+            # Telegram user/chat IDs exceed signed 32-bit INTEGER.
+            statement = re.sub(r"\bINTEGER\b", "BIGINT", statement, flags=re.I)
             self._cur.execute(statement)
         return self._cur
 
     def commit(self): self._conn.commit()
     def rollback(self): self._conn.rollback()
-    def close(self): self._cur.close(); self._conn.close()
+    def close(self): self._cur.close()
+
+_PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
+_POLLING_LOCK_CONN = None
+
+def _get_pg_pool():
+    global _PG_POOL
+    if _PG_POOL is None:
+        with _PG_POOL_LOCK:
+            if _PG_POOL is None:
+                import psycopg2.pool
+                _PG_POOL = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1, maxconn=max(4, int(os.environ.get("DB_POOL_MAX", "8"))),
+                    dsn=DATABASE_URL, connect_timeout=8, sslmode="require",
+                    keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+                )
+    return _PG_POOL
 
 @contextmanager
 def db():
-    """Open a short-lived Supabase PostgreSQL connection."""
-    import psycopg2
-    from psycopg2.extras import DictCursor
-    conn = psycopg2.connect(DATABASE_URL, connect_timeout=15, cursor_factory=DictCursor, sslmode="require")
+    """Borrow a pooled Supabase connection instead of reconnecting per query."""
+    pool = _get_pg_pool()
+    conn = pool.getconn()
     wrapped = _PGConnection(conn)
+    broken = False
     try:
         yield wrapped
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            broken = True
         raise
     finally:
-        wrapped.close()
+        try:
+            wrapped.close()
+        except Exception:
+            broken = True
+        pool.putconn(conn, close=broken or bool(conn.closed))
+
+def _acquire_polling_lock():
+    """Prevent two instances of this version from polling the same bot token."""
+    global _POLLING_LOCK_CONN
+    import psycopg2
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=8, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("SELECT pg_try_advisory_lock(8824815136)")
+    locked = cur.fetchone()[0]
+    cur.close()
+    if not locked:
+        conn.close()
+        raise RuntimeError("Другой экземпляр StarOS Helper уже держит polling-lock в Supabase. Оставь один экземпляр Render/локально.")
+    _POLLING_LOCK_CONN = conn  # Keep this connection open to retain the advisory lock.
+
+def _release_polling_lock():
+    global _POLLING_LOCK_CONN
+    if _POLLING_LOCK_CONN is not None:
+        try:
+            cur = _POLLING_LOCK_CONN.cursor()
+            cur.execute("SELECT pg_advisory_unlock(8824815136)")
+            cur.close()
+            _POLLING_LOCK_CONN.close()
+        except Exception:
+            pass
+        _POLLING_LOCK_CONN = None
 
 def _config_get(key: str, default=None):
     try:
@@ -274,6 +327,31 @@ def init_db():
             payload TEXT NOT NULL
         );
         """)
+        # Upgrade existing schema columns too (CREATE TABLE IF NOT EXISTS does not alter them).
+        id_columns = {
+            "admin_replies": ("chat_id", "admin_id"),
+            "messages": ("chat_id", "user_id"),
+            "chat_settings": ("chat_id",),
+            "warnings": ("chat_id", "user_id", "admin_id"),
+            "profiles": ("chat_id", "user_id"),
+            "notes": ("chat_id", "author_id"),
+            "triggers": ("chat_id", "author_id"),
+            "reports": ("chat_id", "reporter_id", "target_id"),
+            "moderation_state": ("chat_id", "user_id"),
+            "chat_roles": ("chat_id", "user_id", "assigned_by"),
+            "bot_admins": ("user_id", "added_by"),
+            "user_preferences": ("user_id",),
+            "private_recipients": ("user_id",),
+        }
+        for table_name, columns in id_columns.items():
+            existing = {r["column_name"]: r["data_type"] for r in c.execute(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?",
+                (table_name,),
+            ).fetchall()}
+            for column_name in columns:
+                if column_name in existing and existing[column_name] != "bigint":
+                    c.execute(f'ALTER TABLE "{table_name}" ALTER COLUMN "{column_name}" TYPE BIGINT')
+
         c.execute(
             "INSERT OR IGNORE INTO bot_config(key,value) VALUES(?,?)",
             ("whoami_template", json.dumps({"mode": "markdown", "value": WHOAMI_DEFAULT_TEMPLATE}, ensure_ascii=False)),
@@ -723,7 +801,7 @@ def ctx_str(chat_id: int) -> str:
 
 
 def restore_recent_context():
-    """Warm the in-memory context from SQLite after a restart."""
+    """Optional legacy helper; intentionally not called at startup."""
     try:
         with db() as c:
             rows = c.execute(
@@ -1395,6 +1473,9 @@ async def _ensure_user_session_authorized_at_startup() -> None:
             print(f"[user-session] Авторизованная сессия найдена: {TG_SESSION_PATH.name}")
             return
 
+        if not sys.stdin or not sys.stdin.isatty():
+            print("[user-session] Нет интерактивного терминала; вход пропущен, бот продолжит запуск.")
+            return
         print("\n[Telegram user session] Требуется вход в аккаунт. Вводи данные только в этом терминале.")
         phone = (await asyncio.to_thread(input, "Номер Telegram в международном формате (например, +380...): ")).strip()
         if not phone:
@@ -5394,20 +5475,36 @@ async def run_health():
 
 async def main():
     global BOT_ID, BOT_USERNAME
+    started_at = time.time()
     init_db()
-    restore_recent_context()
+    # Do not restore previous chat history: AI context starts clean after every restart.
+    _ctx.clear()
+    _acquire_polling_lock()
     me = await bot.get_me()
     BOT_ID = me.id
     BOT_USERNAME = (me.username or "").lower()
     print(f"StarOS Helper started as @{BOT_USERNAME} (id={BOT_ID})")
-    # If tg.txt exists, ask for phone/code/2FA here when there is no authorized session.
-    # This happens at startup, not only after an unknown @username lookup.
     await _ensure_user_session_authorized_at_startup()
+    # Drop queued updates so only messages arriving after this startup are processed.
+    await bot.delete_webhook(drop_pending_updates=True)
     await run_health()
     asyncio.create_task(learning_worker())
+    print(f"Startup ready in {time.time() - started_at:.2f}s; old Telegram updates discarded")
     try:
-        await dp.start_polling(bot, allowed_updates=list(dict.fromkeys([*dp.resolve_used_update_types(), "chat_member", "message"])))
+        await dp.start_polling(
+            bot,
+            allowed_updates=list(dict.fromkeys([*dp.resolve_used_update_types(), "chat_member", "message"])),
+            handle_as_tasks=True,
+            tasks_concurrency_limit=100,
+        )
     finally:
+        _release_polling_lock()
+        pool = _PG_POOL
+        if pool is not None:
+            try:
+                pool.closeall()
+            except Exception:
+                pass
         await bot.session.close()
 
 

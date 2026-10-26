@@ -1,5 +1,5 @@
 # ============================================================
-# StarOS Helper Bot — aiogram 3.31+ + Groq + SQLite + aiohttp
+# StarOS Helper Bot — aiogram 3.31+ + Groq + Supabase PostgreSQL + aiohttp
 # Telegram Rich Messages / Rich Markdown (Bot API 10.3)
 # ============================================================
 
@@ -9,7 +9,6 @@ import json
 import os
 import re
 import random
-import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -37,7 +36,7 @@ GROQ_SPARE_KEYS = [
     "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",
     "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",
 ]
-GROQ_KEY_STATE_PATH = Path.home() / ".staros_groq_key_state.json"
+GROQ_KEY_STATE_CONFIG_KEY = "active_groq_key_index"
 
 MODEL_FAST = "openai/gpt-oss-20b"
 MODEL_BIG = "openai/gpt-oss-120b"
@@ -82,27 +81,83 @@ WHOAMI_DEFAULT_TEMPLATE = """![Аватар пользователя](tg://photo
 
 Варн: {{warns}} / {{warn_limit}}"""
 
-DB_PATH = Path("staros.db")
-RULES_PATH = Path("learned_rules.json")
-BACKUPS_DIR = Path("backups")
-STATE_PATH = Path("bot_state.json")
-BACKUPS_DIR.mkdir(exist_ok=True)
+# Supabase PostgreSQL connection. Override with SUPABASE_DB_URL in environment.
+DATABASE_URL = os.environ.get(
+    "SUPABASE_DB_URL",
+    "postgresql://postgres.kdcsubngxvpryoqddkux:4B7iC8RNDYae3FlS@aws-0-eu-west-1.pooler.supabase.com:5432/postgres",
+).strip()
 
-# ================= SQLITE =================
+RULES_CONFIG_KEY = "learned_rules_json"
+STATE_CONFIG_KEY = "bot_state_json"
+
+# ================= SUPABASE POSTGRESQL =================
+
+class _PGConnection:
+    """Small compatibility layer for existing parameterized SQL statements."""
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = conn.cursor(cursor_factory=__import__("psycopg2.extras", fromlist=["DictCursor"]).DictCursor)
+
+    def execute(self, sql, params=None):
+        raw = sql.strip()
+        # Translate the few SQLite-only constructs used by this project.
+        raw = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", raw, flags=re.I)
+        was_ignore = bool(re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", sql.strip(), flags=re.I))
+        raw = raw.replace("?", "%s")
+        raw = re.sub(r"ORDER BY rowid DESC", "ORDER BY ctid DESC", raw, flags=re.I)
+        if was_ignore and not re.search(r"ON\s+CONFLICT", raw, flags=re.I):
+            raw = raw.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        self._cur.execute(raw, params or ())
+        return self._cur
+
+    def executemany(self, sql, seq):
+        self._cur.executemany(sql.replace("?", "%s"), seq)
+        return self._cur
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if not statement:
+                continue
+            statement = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", statement, flags=re.I)
+            self._cur.execute(statement)
+        return self._cur
+
+    def commit(self): self._conn.commit()
+    def rollback(self): self._conn.rollback()
+    def close(self): self._cur.close(); self._conn.close()
 
 @contextmanager
 def db():
-    """Open one short-lived SQLite connection and always close it."""
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
+    """Open a short-lived Supabase PostgreSQL connection."""
+    import psycopg2
+    from psycopg2.extras import DictCursor
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=15, cursor_factory=DictCursor, sslmode="require")
+    wrapped = _PGConnection(conn)
     try:
-        yield conn
+        yield wrapped
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
-        conn.close()
+        wrapped.close()
+
+def _config_get(key: str, default=None):
+    try:
+        with db() as c:
+            row = c.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
+            if not row:
+                return default
+            return json.loads(row["value"])
+    except Exception as e:
+        print(f"database config read error ({key}):", e)
+        return default
+
+def _config_set(key: str, value):
+    encoded = json.dumps(value, ensure_ascii=False)
+    with db() as c:
+        c.execute("INSERT INTO bot_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, encoded))
 
 
 def init_db():
@@ -212,6 +267,12 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS learned_rule_backups(
+            id BIGSERIAL PRIMARY KEY,
+            version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        );
         """)
         c.execute(
             "INSERT OR IGNORE INTO bot_config(key,value) VALUES(?,?)",
@@ -229,42 +290,101 @@ def init_db():
             last_seen INTEGER NOT NULL DEFAULT 0
         )""")
         # Additive migrations so an existing staros.db can be reused.
-        settings_columns = {r[1] for r in c.execute("PRAGMA table_info(chat_settings)").fetchall()}
+        settings_columns = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_settings'").fetchall()}
         if "antiflood_enabled" not in settings_columns:
             c.execute("ALTER TABLE chat_settings ADD COLUMN antiflood_enabled INTEGER DEFAULT 0")
-        report_columns = {r[1] for r in c.execute("PRAGMA table_info(reports)").fetchall()}
+        report_columns = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='reports'").fetchall()}
         if "message_id" not in report_columns:
             c.execute("ALTER TABLE reports ADD COLUMN message_id INTEGER DEFAULT 0")
+        # One-time import of legacy local JSON state into Supabase. Files are removed only
+        # after their payload has been stored successfully in PostgreSQL.
+        for legacy_name, config_key in (("learned_rules.json", RULES_CONFIG_KEY), ("bot_state.json", STATE_CONFIG_KEY), (str(Path.home() / ".staros_groq_key_state.json"), GROQ_KEY_STATE_CONFIG_KEY)):
+            legacy_path = Path(legacy_name)
+            if legacy_path.is_file():
+                exists = c.execute("SELECT 1 FROM bot_config WHERE key=?", (config_key,)).fetchone()
+                if not exists:
+                    try:
+                        legacy_value = json.loads(legacy_path.read_text(encoding="utf-8"))
+                        c.execute("INSERT INTO bot_config(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (config_key, json.dumps(legacy_value, ensure_ascii=False)))
+                        legacy_path.unlink(missing_ok=True)
+                        print(f"Migrated {legacy_path.name} to Supabase")
+                    except Exception as migration_error:
+                        print(f"Legacy migration failed for {legacy_path.name}:", migration_error)
+        legacy_backups = Path("backups")
+        if legacy_backups.is_dir():
+            for backup_path in sorted(legacy_backups.glob("learned_rules_v*.json")):
+                try:
+                    payload = json.loads(backup_path.read_text(encoding="utf-8"))
+                    marker = backup_path.name
+                    already = c.execute("SELECT 1 FROM learned_rule_backups WHERE created_at=?", (marker,)).fetchone()
+                    if not already:
+                        version = int(payload.get("version", 0))
+                        c.execute("INSERT INTO learned_rule_backups(version,created_at,payload) VALUES(?,?,?)", (version, marker, json.dumps(payload, ensure_ascii=False)))
+                    backup_path.unlink(missing_ok=True)
+                except Exception as migration_error:
+                    print(f"Legacy backup migration failed for {backup_path.name}:", migration_error)
+            try:
+                legacy_backups.rmdir()
+            except OSError:
+                pass
+
+    # Import legacy SQLite records once, preserving chat settings, profiles, ranks,
+    # messages and moderation history. The old DB is removed only after a successful commit.
+    legacy_db = Path("staros.db")
+    if legacy_db.is_file():
+        import sqlite3 as _sqlite3
+        try:
+            old = _sqlite3.connect(str(legacy_db))
+            old.row_factory = _sqlite3.Row
+            table_names = [
+                "admin_replies", "messages", "chat_settings", "warnings", "profiles",
+                "notes", "triggers", "reports", "moderation_state", "chat_roles",
+                "bot_admins", "bot_config", "user_preferences", "private_recipients",
+            ]
+            with db() as pg:
+                for table in table_names:
+                    exists = old.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                    if not exists:
+                        continue
+                    rows = old.execute(f'SELECT * FROM "{table}"').fetchall()
+                    if not rows:
+                        continue
+                    columns = [item[1] for item in old.execute(f'PRAGMA table_info("{table}")').fetchall()]
+                    col_sql = ",".join('"' + name.replace('"', '""') + '"' for name in columns)
+                    placeholders = ",".join(["?"] * len(columns))
+                    sql = f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders}) ON CONFLICT DO NOTHING'
+                    for row in rows:
+                        pg.execute(sql, tuple(row[name] for name in columns))
+                for table in ("admin_replies", "messages", "warnings", "reports"):
+                    pg.execute(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM {table}), 1), 1), EXISTS(SELECT 1 FROM {table}))")
+            old.close()
+            legacy_db.unlink(missing_ok=True)
+            print("Migrated legacy staros.db into Supabase PostgreSQL and removed local database file")
+        except Exception as migration_error:
+            print("SQLite-to-Supabase migration failed; staros.db was kept:", migration_error)
+            try: old.close()
+            except Exception: pass
 
 
 # ================= RULES =================
 
 def load_rules() -> dict:
-    if RULES_PATH.exists():
-        try:
-            data = json.loads(RULES_PATH.read_text("utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("rules"), list):
-                data.setdefault("version", 0)
-                data.setdefault("updated_at", None)
-                data["rules"] = [str(rule)[:500] for rule in data["rules"] if str(rule).strip()][-MAX_RULES:]
-                return data
-        except Exception as e:
-            print("load rules err:", e)
+    data = _config_get(RULES_CONFIG_KEY, None)
+    if isinstance(data, dict) and isinstance(data.get("rules"), list):
+        data.setdefault("version", 0)
+        data.setdefault("updated_at", None)
+        data["rules"] = [str(rule)[:500] for rule in data["rules"] if str(rule).strip()][-MAX_RULES:]
+        return data
     return {"version": 0, "updated_at": None, "rules": []}
 
-
 def save_rules(data: dict):
-    RULES_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
+    _config_set(RULES_CONFIG_KEY, data)
 
 def backup_rules(data: dict):
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = BACKUPS_DIR / f"learned_rules_v{data['version']}_{ts}.json"
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    with db() as c:
+        c.execute("INSERT INTO learned_rule_backups(version,created_at,payload) VALUES(?,?,?)",
+                   (int(data.get("version", 0)), ts, json.dumps(data, ensure_ascii=False)))
 
 
 # Keep the full memory on disk, but pass only a compact relevant subset to the model.
@@ -388,34 +508,37 @@ def _store_manual_rule(data: dict, rule: str) -> tuple[str, int]:
     return "added", len(rules)
 
 
+
+def _load_bot_state() -> dict:
+    value = _config_get(STATE_CONFIG_KEY, {})
+    return value if isinstance(value, dict) else {}
+
+def _save_bot_state(state: dict) -> None:
+    _config_set(STATE_CONFIG_KEY, state)
+
 # ================= STAROS AI GROUPS =================
 
 def load_ai_group_ids() -> set[int]:
     ids = {int(x) for x in STAROS_AI_GROUP_IDS if str(x).lstrip("-").isdigit()}
-    if STATE_PATH.exists():
-        try:
-            state = json.loads(STATE_PATH.read_text("utf-8"))
-            saved = state.get("ai_group_ids", [])
-            ids.update(int(x) for x in saved if str(x).lstrip("-").isdigit())
-            # Migrate the older single target_chat_id setting.
-            old = state.get("target_chat_id")
-            if old is not None:
-                ids.add(int(old))
-        except Exception as e:
-            print("load AI groups err:", e)
+    try:
+        state = _load_bot_state()
+        saved = state.get("ai_group_ids", [])
+        ids.update(int(x) for x in saved if str(x).lstrip("-").isdigit())
+        old = state.get("target_chat_id")
+        if old is not None:
+            ids.add(int(old))
+    except Exception as e:
+        print("load AI groups err:", e)
     return ids
 
 def save_ai_group(chat_id: int):
-    state = {}
-    if STATE_PATH.exists():
-        try: state = json.loads(STATE_PATH.read_text("utf-8"))
-        except Exception: state = {}
+    state = _load_bot_state()
     ids = {int(x) for x in state.get("ai_group_ids", []) if str(x).lstrip("-").isdigit()}
     ids.update(int(x) for x in STAROS_AI_GROUP_IDS)
     ids.add(int(chat_id))
     state["ai_group_ids"] = sorted(ids)
     state["target_chat_id"] = int(chat_id)  # legacy compatibility
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _save_bot_state(state)
 
 def load_target_chat() -> int | None:
     ids = load_ai_group_ids()
@@ -455,7 +578,7 @@ def _load_active_groq_key_index(key_count: int) -> int:
     if key_count <= 0:
         return 0
     try:
-        data = json.loads(GROQ_KEY_STATE_PATH.read_text("utf-8"))
+        data = _config_get(GROQ_KEY_STATE_CONFIG_KEY, {"index": 0})
         return max(0, min(int(data.get("index", 0)), key_count - 1))
     except Exception:
         return 0
@@ -463,10 +586,9 @@ def _load_active_groq_key_index(key_count: int) -> int:
 
 def _save_active_groq_key_index(index: int) -> None:
     try:
-        GROQ_KEY_STATE_PATH.write_text(json.dumps({"index": int(index)}), encoding="utf-8")
-    except Exception:
-        # A read-only home directory must not stop the bot.
-        pass
+        _config_set(GROQ_KEY_STATE_CONFIG_KEY, {"index": int(index)})
+    except Exception as e:
+        print("could not save Groq key rotation state to Supabase:", e)
 
 
 def _is_token_quota_exhaustion(status: int, data) -> bool:
@@ -1145,13 +1267,13 @@ COMMAND_HELP = """<b>Команды StarOS Helper</b>
 Полный справочник: ссылка на Telegraph в кнопке выше."""
 
 
-def _settings(chat_id: int) -> sqlite3.Row:
+def _settings(chat_id: int):
     with db() as c:
         c.execute("INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)", (chat_id,))
         return c.execute("SELECT * FROM chat_settings WHERE chat_id=?", (chat_id,)).fetchone()
 
 
-def _profile(chat_id: int, user_id: int, username: str = "") -> sqlite3.Row:
+def _profile(chat_id: int, user_id: int, username: str = ""):
     with db() as c:
         c.execute(
             "INSERT OR IGNORE INTO profiles(chat_id,user_id,username) VALUES(?,?,?)",
@@ -2304,23 +2426,18 @@ def _panel_config_dict(chat_id: int) -> dict:
         "rules": str(st["rules"] or ""),
         "welcome": str(st["welcome"] or ""),
         "ai_group_bound": chat_id in load_ai_group_ids(),
-        "note": " learned_rules.json и настройки ключей API не включены в этот конфиг.",
+        "note": "Данные конфигурации и память хранятся в Supabase PostgreSQL.",
     }
 
 
 def _remove_ai_group(chat_id: int) -> None:
-    state = {}
-    if STATE_PATH.exists():
-        try:
-            state = json.loads(STATE_PATH.read_text("utf-8"))
-        except Exception:
-            state = {}
+    state = _load_bot_state()
     ids = {int(x) for x in state.get("ai_group_ids", []) if str(x).lstrip("-").isdigit()}
     ids.discard(int(chat_id))
     state["ai_group_ids"] = sorted(ids)
     if int(state.get("target_chat_id", 0) or 0) == int(chat_id):
         state["target_chat_id"] = ids[0] if ids else None
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _save_bot_state(state)
 
 
 PANEL_MEMORY_SELECTION: dict[int, set[int]] = {}
@@ -3846,8 +3963,7 @@ async def handle_iris_command(msg: Message, text: str) -> bool:
         target = msg.reply_to_message.from_user if msg.reply_to_message and msg.reply_to_message.from_user else None
         source_message_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
         with db() as c:
-            c.execute("INSERT INTO reports(chat_id,reporter_id,target_id,reason,created_at,status,message_id) VALUES(?,?,?,?,?,'open',?)", (chat_id, user.id, target.id if target else None, reason[:1000], int(time.time()), source_message_id))
-            report_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            report_id = c.execute("INSERT INTO reports(chat_id,reporter_id,target_id,reason,created_at,status,message_id) VALUES(?,?,?,?,?,'open',?) RETURNING id", (chat_id, user.id, target.id if target else None, reason[:1000], int(time.time()), source_message_id)).fetchone()[0]
         english_command = _is_english_command_text(msg.text or "")
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Close report" if english_command else "Закрыть репорт", callback_data=f"close_report:{chat_id}:{report_id}")]])
         await _command_reply(msg, f"{ce('report', '📩')}Репорт отправлен!", html_mode=True, reply_markup=keyboard)
@@ -4237,14 +4353,30 @@ async def handle_iris_command(msg: Message, text: str) -> bool:
 
 
 async def handle_automatic_moderation(msg: Message) -> bool:
-    """Run simple opt-in link filtering and saved text triggers. True means consumed/deleted."""
+    """Run opt-in moderation, but never auto-delete channel-authored posts."""
+    # Channel posts can appear in groups as sender_chat posts or automatic
+    # forwards from a linked channel. They must be exempt from link filtering
+    # and antiflood regardless of the current chat configuration.
+    if getattr(msg, "sender_chat", None) is not None or bool(getattr(msg, "is_automatic_forward", False)):
+        return False
+    if msg.chat.type == "channel":
+        return False
     if not msg.from_user or not msg.text or msg.text.startswith("/"):
         return False
     st = _settings(msg.chat.id)
     text = msg.text.strip()
+    # Detect links independently from the configured link filter. Telegram entities
+    # catch hidden text links that a plain-text regex cannot see.
+    has_link = bool(re.search(r"(?:https?://|t\.me/|www\.)", text, re.I))
+    for entity in (msg.entities or []):
+        if getattr(entity, "type", None) in {"url", "text_link"}:
+            has_link = True
+            break
     # Admins are exempt from automated restrictions.
     sender_admin = await is_admin(msg.chat.id, msg.from_user.id)
-    if st["antiflood_enabled"] and not sender_admin:
+    # A link that is explicitly allowed must not be removed as a side effect of
+    # the anti-flood handler either (previously the 6th rapid message could be a link).
+    if st["antiflood_enabled"] and not sender_admin and not has_link:
         key = (msg.chat.id, msg.from_user.id)
         now = time.time()
         queue = _flood_tracker[key]
@@ -4260,7 +4392,9 @@ async def handle_automatic_moderation(msg: Message) -> bool:
                 return True
             except Exception as e:
                 print("antiflood action err:",repr(e))
-    if st["links_enabled"] and not sender_admin and re.search(r"(?:https?://|t\.me/|www\.)", text, re.I):
+    # links_enabled is 1 only when links are blocked. Keep this check isolated
+    # from anti-flood and other moderation settings.
+    if int(st["links_enabled"] or 0) == 1 and not sender_admin and has_link:
         try:
             await bot.delete_message(msg.chat.id,msg.message_id)
             await _command_reply(msg,"Ссылки запрещены настройками чата.")
@@ -4450,6 +4584,11 @@ async def on_new_member_service_message(msg: Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}) & F.text)
 async def on_chat(msg: Message):
+    # Do not process or delete posts authored by a channel (including linked-channel forwards).
+    if getattr(msg, "sender_chat", None) is not None or bool(getattr(msg, "is_automatic_forward", False)):
+        return
+    if msg.chat.type == "channel":
+        return
     if not msg.from_user or msg.from_user.is_bot or not msg.text:
         return
     if not remember_processed(msg.chat.id, msg.message_id):
@@ -4712,7 +4851,8 @@ async def handle_teacher_command(msg: Message, dm: bool):
 async def kirillox(msg: Message, text: str):
     parts = text.split()
     data = load_rules()
-    backups = sorted(BACKUPS_DIR.glob("learned_rules_v*.json"))
+    with db() as c:
+        backups = c.execute("SELECT id,version,created_at,payload FROM learned_rule_backups ORDER BY id ASC").fetchall()
 
     async def out(body: str):
         return await msg.answer(
@@ -4726,7 +4866,7 @@ async def kirillox(msg: Message, text: str):
             f"Текущая версия: v{data['version']} ({len(data['rules'])} правил)",
             "Бекапы:",
         ]
-        lines.extend(f"• {path.name}" for path in backups[-15:])
+        lines.extend(f"• v{row['version']} — {row['created_at']}" for row in backups[-15:])
         lines.append("Откат: /kirillox <номер версии> или /kirillox latest")
         return await out("\n".join(lines))
 
@@ -4749,13 +4889,13 @@ async def kirillox(msg: Message, text: str):
             return await out("Бекапов нет.")
         target = backups[-1]
     else:
-        matches = [path for path in backups if f"_v{arg}_" in path.name]
+        matches = [row for row in backups if str(row["version"]) == str(arg)]
         if not matches:
             return await out(f"Бекап v{arg} не найден.")
         target = matches[-1]
 
     try:
-        backup_data = json.loads(target.read_text("utf-8"))
+        backup_data = json.loads(target["payload"])
     except Exception as e:
         return await out(f"Битый бекап: {e}")
 
@@ -4765,7 +4905,7 @@ async def kirillox(msg: Message, text: str):
     data["rules"] = backup_data.get("rules", [])[-MAX_RULES:]
     save_rules(data)
     return await out(
-        f"Откатил с {target.name} → новая версия v{data['version']} "
+        f"Откатил с бекапа v{target['version']} → новая версия v{data['version']} "
         f"({len(data['rules'])} правил)"
     )
 
